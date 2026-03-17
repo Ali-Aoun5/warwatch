@@ -21,11 +21,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============ CONFIGURATION ============
-APIFY_TOKEN = "apify_api_wtaTqvoo2lEOEzaAio6PySUIDpFaH90gRJtZ"
-APIFY_DATASET_ID = "dYy7Bkz9kOCT2aeKN"
-QDRANT_URL = "https://dd5f5d46-e566-4409-beeb-c9a648ade4bc.eu-central-1-0.aws.cloud.qdrant.io"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIn0.V8ansdYNHvhnXORumgq7mNRlm9nyJ_-KnUfASgKFZeE"
-FEATHERLESS_KEY = "rc_8a722edee3da1e4ab748e8f0d6645579aad68e935c11b087d702b561c7b092ac"
+from dotenv import load_dotenv
+load_dotenv()
+
+APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
+APIFY_DATASET_ID = os.environ.get("APIFY_DATASET_ID", "dYy7Bkz9kOCT2aeKN")
+QDRANT_URL = os.environ.get("QDRANT_URL")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
+FEATHERLESS_KEY = os.environ.get("FEATHERLESS_KEY")
 COLLECTION_NAME = "warwatch_articles"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
