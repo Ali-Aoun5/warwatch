@@ -10,11 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
-    Distance, VectorParams, PointStruct, 
+    Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue,
     SearchRequest
 )
 from sentence_transformers import SentenceTransformer
+from apify_client import ApifyClient
 import uvicorn
 
 logging.basicConfig(level=logging.INFO)
@@ -32,23 +33,42 @@ FEATHERLESS_KEY = os.environ.get("FEATHERLESS_KEY")
 COLLECTION_NAME = "warwatch_articles"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
-# Source trust scores based on journalistic reputation
+RSS_FEEDS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://feeds.bbci.co.uk/news/middle_east/rss.xml",
+    "https://www.aljazeera.com/xml/rss/all.xml",
+    "https://rss.dw.com/rdf/rss-en-all",
+    "https://feeds.npr.org/1001/rss.xml",
+    "https://feeds.skynews.com/feeds/rss/world.xml",
+    "https://www.theguardian.com/world/rss",
+    "https://www.middleeasteye.net/rss",
+    "https://feeds.feedburner.com/ndtvnews-world-news",
+    "https://rss.cnn.com/rss/edition_world.rss",
+    "https://feeds.washingtonpost.com/rss/world",
+    "https://feeds.feedburner.com/time/world"
+]
+
 SOURCE_TRUST = {
     "bbci.co.uk": 90,
     "bbc.com": 90,
     "reuters.com": 92,
     "npr.org": 88,
     "dw.com": 87,
+    "theguardian.com": 88,
+    "washingtonpost.com": 85,
+    "middleeasteye.net": 72,
     "skynews.com": 75,
     "aljazeera.com": 72,
     "ndtv.com": 68,
+    "cnn.com": 80,
+    "time.com": 82,
     "feedburner.com": 55,
     "rt.com": 25,
     "sputniknews.com": 20,
 }
 
 # ============ INITIALIZE SERVICES ============
-app = FastAPI(title="WarWatch API", version="2.0")
+app = FastAPI(title="Sentinel API", version="2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -63,6 +83,21 @@ embedder = SentenceTransformer(EMBEDDING_MODEL)
 print("Embedding model loaded successfully")
 
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+
+# ============ APIFY SDK INTEGRATION ============
+
+def trigger_fresh_apify_run() -> str:
+    logger.info("Triggering fresh Apify run via SDK...")
+    client = ApifyClient(APIFY_TOKEN)
+    run = client.actor("eloquent_mountain/rss-feed-aggregator").call(
+        run_input={
+            "urls": RSS_FEEDS,
+            "maxItemsPerFeed": 15
+        }
+    )
+    new_dataset_id = run["defaultDatasetId"]
+    logger.info(f"Apify run completed. New dataset ID: {new_dataset_id}")
+    return new_dataset_id
 
 # ============ HELPER FUNCTIONS ============
 
@@ -95,9 +130,11 @@ def clean_html(text: str) -> str:
 def generate_article_id(url: str) -> int:
     return int(hashlib.md5(url.encode()).hexdigest()[:8], 16)
 
-def fetch_apify_articles() -> list:
-    logger.info("Fetching articles from Apify dataset...")
-    url = f"https://api.apify.com/v2/datasets/{APIFY_DATASET_ID}/items"
+def fetch_apify_articles(dataset_id: str = None) -> list:
+    if dataset_id is None:
+        dataset_id = APIFY_DATASET_ID
+    logger.info(f"Fetching articles from Apify dataset: {dataset_id}")
+    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
     params = {
         "token": APIFY_TOKEN,
         "limit": 200,
@@ -106,26 +143,26 @@ def fetch_apify_articles() -> list:
     response = requests.get(url, params=params, timeout=30)
     response.raise_for_status()
     raw_items = response.json()
-    
+
     articles = []
     for item in raw_items:
         title = item.get("title", "")
         if isinstance(title, dict):
             title = title.get("value", "")
-        
+
         summary = item.get("summary", "") or item.get("description", "")
         if isinstance(summary, dict):
             summary = summary.get("value", "")
-        
+
         link = item.get("link", "") or item.get("href", "")
         if isinstance(link, list) and link:
             link = link[0].get("href", "") if isinstance(link[0], dict) else link[0]
-        
+
         published = item.get("published", "") or item.get("pubDate", "")
-        
+
         title = clean_html(str(title))
         summary = clean_html(str(summary))
-        
+
         if title and len(title) > 10:
             articles.append({
                 "title": title,
@@ -137,18 +174,18 @@ def fetch_apify_articles() -> list:
                 "trust_label": get_trust_label(get_trust_score(str(link))),
                 "scraped_at": datetime.now().isoformat()
             })
-    
+
     logger.info(f"Fetched {len(articles)} valid articles from Apify")
     return articles
 
 def setup_qdrant_collection():
     collections = qdrant.get_collections().collections
     existing = [c.name for c in collections]
-    
+
     if COLLECTION_NAME in existing:
         logger.info(f"Collection {COLLECTION_NAME} already exists")
         return
-    
+
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
         vectors_config=VectorParams(
@@ -160,10 +197,10 @@ def setup_qdrant_collection():
 
 def store_articles_in_qdrant(articles: list):
     logger.info(f"Storing {len(articles)} articles in Qdrant...")
-    
+
     texts = [f"{a['title']} {a['summary']}" for a in articles]
     embeddings = embedder.encode(texts, show_progress_bar=True, batch_size=32)
-    
+
     points = []
     for i, (article, embedding) in enumerate(zip(articles, embeddings)):
         point_id = generate_article_id(article["link"] + str(i))
@@ -172,7 +209,7 @@ def store_articles_in_qdrant(articles: list):
             vector=embedding.tolist(),
             payload=article
         ))
-    
+
     batch_size = 50
     for i in range(0, len(points), batch_size):
         batch = points[i:i + batch_size]
@@ -181,7 +218,7 @@ def store_articles_in_qdrant(articles: list):
             points=batch
         )
         logger.info(f"Stored batch {i//batch_size + 1}")
-    
+
     logger.info("All articles stored in Qdrant successfully")
     return len(points)
 
@@ -199,7 +236,7 @@ def search_similar_articles(query: str, limit: int = 15) -> list:
 def analyze_with_ai(articles: list, topic: str) -> dict:
     if not articles:
         return {"error": "No articles found for this topic"}
-    
+
     articles_text = ""
     for i, a in enumerate(articles[:10]):
         articles_text += f"\nARTICLE {i+1}:\n"
@@ -208,7 +245,7 @@ def analyze_with_ai(articles: list, topic: str) -> dict:
         articles_text += f"Title: {a.get('title', '')}\n"
         articles_text += f"Content: {a.get('summary', '')}\n"
         articles_text += "---"
-    
+
     prompt = f"""You are an expert conflict zone misinformation analyst working for a major fact-checking organization.
 
 Analyze these news articles about: "{topic}"
@@ -232,7 +269,7 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
     "<suspicious pattern 1>",
     "<suspicious pattern 2>"
   ],
-  "viral_prediction": "<which narrative is most likely to spread in next 6 hours and why>",
+  "viral_prediction": "<which narrative is most likely to gain traction in next 6 hours and why>",
   "recommended_actions": [
     "<action for journalists 1>",
     "<action for journalists 2>",
@@ -257,7 +294,7 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
                 "model": "mistralai/Mistral-7B-Instruct-v0.3",
                 "messages": [
                     {
-                        "role": "system", 
+                        "role": "system",
                         "content": "You are a misinformation detection expert. Always respond with valid JSON only. No markdown, no explanation outside JSON."
                     },
                     {"role": "user", "content": prompt}
@@ -267,17 +304,17 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
             },
             timeout=30
         )
-        
+
         result = response.json()
         content = result['choices'][0]['message']['content']
-        
+
         import json
         import re
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
         return json.loads(content)
-        
+
     except Exception as e:
         logger.error(f"AI analysis error: {e}")
         return {
@@ -286,7 +323,7 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
             "detected_narratives": ["Analysis temporarily unavailable"],
             "contradictions": [],
             "suspicious_patterns": [],
-            "viral_prediction": "Unable to generate prediction at this time",
+            "viral_prediction": "Unable to generate assessment at this time",
             "recommended_actions": ["Verify information with multiple sources"],
             "source_analysis": {
                 "most_reliable": "BBC",
@@ -300,9 +337,9 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting WarWatch API...")
+    logger.info("Starting Sentinel API...")
     setup_qdrant_collection()
-    
+
     collection_info = qdrant.get_collection(COLLECTION_NAME)
     if collection_info.points_count == 0:
         logger.info("No articles in database. Fetching from Apify...")
@@ -317,9 +354,11 @@ async def startup_event():
 async def root():
     collection_info = qdrant.get_collection(COLLECTION_NAME)
     return {
-        "status": "WarWatch API is running",
+        "status": "Sentinel API is running",
         "version": "2.0",
         "articles_in_database": collection_info.points_count,
+        "apify_integration": "Apify SDK + RSS Feed Aggregator Actor",
+        "qdrant_integration": "Semantic vector search with cosine similarity",
         "endpoints": [
             "/api/live-feed",
             "/api/analyze/{topic}",
@@ -334,14 +373,14 @@ async def get_live_feed(limit: int = 30):
     try:
         collection_info = qdrant.get_collection(COLLECTION_NAME)
         total = collection_info.points_count
-        
+
         results = qdrant.scroll(
             collection_name=COLLECTION_NAME,
             limit=limit,
             with_payload=True,
             with_vectors=False
         )
-        
+
         articles = []
         for point in results[0]:
             p = point.payload
@@ -356,9 +395,9 @@ async def get_live_feed(limit: int = 30):
                 "trust_label": p.get("trust_label", "uncertain"),
                 "scraped_at": p.get("scraped_at", "")
             })
-        
+
         articles.sort(key=lambda x: x["trust_score"])
-        
+
         return {
             "total_articles": total,
             "returned": len(articles),
@@ -373,23 +412,22 @@ async def analyze_topic(topic: str):
     try:
         logger.info(f"Analyzing topic: {topic}")
         similar_results = search_similar_articles(topic, limit=15)
-        
+
         if not similar_results:
             raise HTTPException(
-                status_code=404, 
+                status_code=404,
                 detail=f"No articles found for topic: {topic}"
             )
-        
+
         articles = []
         for r in similar_results:
             article = r.payload.copy()
             article["similarity_score"] = round(r.score, 3)
             articles.append(article)
-        
+
         analysis = analyze_with_ai(articles, topic)
-        
         avg_trust = sum(a.get("trust_score", 50) for a in articles) / len(articles)
-        
+
         return {
             "topic": topic,
             "articles_analyzed": len(articles),
@@ -407,14 +445,14 @@ async def analyze_topic(topic: str):
 async def get_network(topic: str):
     try:
         similar_results = search_similar_articles(topic, limit=20)
-        
+
         if not similar_results:
             raise HTTPException(status_code=404, detail="No articles found")
-        
+
         nodes = []
         edges = []
         seen_sources = {}
-        
+
         for i, result in enumerate(similar_results):
             p = result.payload
             source_domain = ""
@@ -423,7 +461,7 @@ async def get_network(topic: str):
                 if domain in link:
                     source_domain = domain
                     break
-            
+
             node = {
                 "id": str(result.id),
                 "title": p.get("title", "")[:60],
@@ -435,10 +473,10 @@ async def get_network(topic: str):
                 "link": link
             }
             nodes.append(node)
-            
+
             if source_domain not in seen_sources:
                 seen_sources[source_domain] = str(result.id)
-            
+
             if i > 0:
                 edges.append({
                     "from": nodes[i-1]["id"],
@@ -446,7 +484,7 @@ async def get_network(topic: str):
                     "weight": round(result.score, 3),
                     "label": f"{round(result.score * 100)}% similar"
                 })
-        
+
         return {
             "topic": topic,
             "nodes": nodes,
@@ -461,18 +499,16 @@ async def get_network(topic: str):
 @app.get("/api/refresh")
 async def refresh_data():
     try:
-        logger.info("Refreshing data from Apify...")
-        articles = fetch_apify_articles()
-        
+        new_dataset_id = trigger_fresh_apify_run()
+        articles = fetch_apify_articles(new_dataset_id)
         if not articles:
             raise HTTPException(status_code=500, detail="Failed to fetch articles from Apify")
-        
         stored = store_articles_in_qdrant(articles)
-        
         return {
             "status": "success",
             "articles_fetched": len(articles),
             "articles_stored": stored,
+            "apify_dataset_id": new_dataset_id,
             "refreshed_at": datetime.now().isoformat()
         }
     except HTTPException:
@@ -484,28 +520,28 @@ async def refresh_data():
 async def get_stats():
     try:
         collection_info = qdrant.get_collection(COLLECTION_NAME)
-        
+
         results = qdrant.scroll(
             collection_name=COLLECTION_NAME,
             limit=200,
             with_payload=True,
             with_vectors=False
         )
-        
+
         trust_distribution = {"trusted": 0, "uncertain": 0, "flagged": 0}
         sources = {}
-        
+
         for point in results[0]:
             p = point.payload
             label = p.get("trust_label", "uncertain")
             trust_distribution[label] = trust_distribution.get(label, 0) + 1
-            
+
             link = p.get("link", "")
             for domain in SOURCE_TRUST.keys():
                 if domain in link:
                     sources[domain] = sources.get(domain, 0) + 1
                     break
-        
+
         return {
             "total_articles": collection_info.points_count,
             "trust_distribution": trust_distribution,
@@ -519,12 +555,12 @@ async def get_stats():
 # ============ RUN SERVER ============
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("WARWATCH API STARTING")
+    print("SENTINEL API STARTING")
     print("="*50)
     print("API will be available at: http://localhost:8000")
     print("API docs at: http://localhost:8000/docs")
     print("="*50 + "\n")
-    
+
     uvicorn.run(
         app,
         host="0.0.0.0",
