@@ -2,7 +2,7 @@
 
 **Know the narrative before it spreads.**
 
-[![Live Demo](https://img.shields.io/badge/Live%20Demo-sentinel--checker.lovable.app-blue)](https://sentinel-checker.lovable.app)
+
 [![Backend API](https://img.shields.io/badge/Backend%20API-HuggingFace%20Spaces-yellow)](https://AliAounMehdi-sentinel.hf.space)
 [![Built for](https://img.shields.io/badge/Built%20for-GenAI%20Z%C3%BCrich%20Hackathon%202026-green)](https://genaizurich.devpost.com)
 
@@ -16,13 +16,6 @@ The system does not claim to identify fake news. It identifies contradictions be
 
 ---
 
-## Live Demo
-
-Try it now at [sentinel-checker.lovable.app](https://sentinel-checker.lovable.app)
-
-Search any conflict topic: **Iran**, **Gaza**, **Ukraine**, **ceasefire**
-
----
 
 ## Features
 
