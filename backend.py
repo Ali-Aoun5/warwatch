@@ -2,17 +2,17 @@ import os
 import hashlib
 import asyncio
 import logging
+import re
+import json
 from datetime import datetime
 from typing import Optional
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance, VectorParams, PointStruct,
     Filter, FieldCondition, MatchValue,
-    SearchRequest
 )
 from sentence_transformers import SentenceTransformer
 from apify_client import ApifyClient
@@ -26,12 +26,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 APIFY_TOKEN = os.environ.get("APIFY_TOKEN")
-APIFY_DATASET_ID = os.environ.get("APIFY_DATASET_ID", "dYy7Bkz9kOCT2aeKN")
 QDRANT_URL = os.environ.get("QDRANT_URL")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 FEATHERLESS_KEY = os.environ.get("FEATHERLESS_KEY")
-COLLECTION_NAME = "warwatch_articles"
+
+# *** YOUR OWN ACTOR ID — fill this in after you publish your Actor on Apify ***
+# It will look like: "your_username/sentinel-rss-actor"
+YOUR_ACTOR_ID = os.environ.get("SENTINEL_ACTOR_ID", "YOUR_USERNAME/sentinel-rss-actor")
+
+COLLECTION_NAME = "sentinel_articles_v2"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+REFRESH_INTERVAL_SECONDS = 1800  # Auto-refresh every 30 minutes
 
 RSS_FEEDS = [
     "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -68,7 +73,7 @@ SOURCE_TRUST = {
 }
 
 # ============ INITIALIZE SERVICES ============
-app = FastAPI(title="Sentinel API", version="2.0")
+app = FastAPI(title="Sentinel API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,26 +83,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-print("Loading embedding model... please wait 30 seconds")
+print("Loading embedding model...")
 embedder = SentenceTransformer(EMBEDDING_MODEL)
 print("Embedding model loaded successfully")
 
 qdrant = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
 
-# ============ APIFY SDK INTEGRATION ============
+# Track last refresh time
+last_refresh_time = None
+last_article_count = 0
+
+# ============ APIFY — YOUR OWN ACTOR ============
 
 def trigger_fresh_apify_run() -> str:
-    logger.info("Triggering fresh Apify run via SDK...")
+    """Trigger YOUR OWN Sentinel Actor on Apify and return the new dataset ID."""
+    logger.info(f"Triggering Sentinel Actor: {YOUR_ACTOR_ID}")
     client = ApifyClient(APIFY_TOKEN)
-    run = client.actor("eloquent_mountain/rss-feed-aggregator").call(
+    run = client.actor(YOUR_ACTOR_ID).call(
         run_input={
             "urls": RSS_FEEDS,
             "maxItemsPerFeed": 15
         }
     )
     new_dataset_id = run["defaultDatasetId"]
-    logger.info(f"Apify run completed. New dataset ID: {new_dataset_id}")
+    logger.info(f"Actor run completed. Dataset ID: {new_dataset_id}")
     return new_dataset_id
+
+def fetch_articles_from_dataset(dataset_id: str) -> list:
+    """Fetch articles from an Apify dataset."""
+    logger.info(f"Fetching from dataset: {dataset_id}")
+    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+    params = {"token": APIFY_TOKEN, "limit": 200, "clean": 1}
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    raw_items = response.json()
+
+    articles = []
+    for item in raw_items:
+        title = item.get("title", "")
+        summary = item.get("summary", "") or item.get("description", "")
+        link = item.get("link", "")
+        published = item.get("published", "") or item.get("scraped_at", datetime.now().isoformat())
+
+        title = clean_html(str(title))
+        summary = clean_html(str(summary))
+
+        if title and len(title) > 10:
+            articles.append({
+                "title": title,
+                "summary": summary,
+                "link": str(link),
+                "published": str(published),
+                "source": str(link),
+                "trust_score": get_trust_score(str(link)),
+                "trust_label": get_trust_label(get_trust_score(str(link))),
+                "scraped_at": datetime.now().isoformat()
+            })
+
+    logger.info(f"Fetched {len(articles)} articles")
+    return articles
 
 # ============ HELPER FUNCTIONS ============
 
@@ -121,89 +165,50 @@ def get_trust_label(score: int) -> str:
 def clean_html(text: str) -> str:
     if not text:
         return ""
-    import re
     clean = re.sub(r'<[^>]+>', '', text)
     clean = re.sub(r'&[a-zA-Z]+;', ' ', clean)
     clean = ' '.join(clean.split())
     return clean[:800]
 
-def generate_article_id(url: str) -> int:
-    return int(hashlib.md5(url.encode()).hexdigest()[:8], 16)
-
-def fetch_apify_articles(dataset_id: str = None) -> list:
-    if dataset_id is None:
-        dataset_id = APIFY_DATASET_ID
-    logger.info(f"Fetching articles from Apify dataset: {dataset_id}")
-    url = f"https://api.apify.com/v2/datasets/{dataset_id}/items"
-    params = {
-        "token": APIFY_TOKEN,
-        "limit": 200,
-        "clean": 1
-    }
-    response = requests.get(url, params=params, timeout=30)
-    response.raise_for_status()
-    raw_items = response.json()
-
-    articles = []
-    for item in raw_items:
-        title = item.get("title", "")
-        if isinstance(title, dict):
-            title = title.get("value", "")
-
-        summary = item.get("summary", "") or item.get("description", "")
-        if isinstance(summary, dict):
-            summary = summary.get("value", "")
-
-        link = item.get("link", "") or item.get("href", "")
-        if isinstance(link, list) and link:
-            link = link[0].get("href", "") if isinstance(link[0], dict) else link[0]
-
-        published = item.get("published", "") or item.get("pubDate", "")
-
-        title = clean_html(str(title))
-        summary = clean_html(str(summary))
-
-        if title and len(title) > 10:
-            articles.append({
-                "title": title,
-                "summary": summary,
-                "link": str(link),
-                "published": str(published),
-                "source": str(link),
-                "trust_score": get_trust_score(str(link)),
-                "trust_label": get_trust_label(get_trust_score(str(link))),
-                "scraped_at": datetime.now().isoformat()
-            })
-
-    logger.info(f"Fetched {len(articles)} valid articles from Apify")
-    return articles
+def generate_article_id(url: str, index: int = 0) -> int:
+    return int(hashlib.md5(f"{url}{index}".encode()).hexdigest()[:8], 16)
 
 def setup_qdrant_collection():
     collections = qdrant.get_collections().collections
     existing = [c.name for c in collections]
 
-    if COLLECTION_NAME in existing:
-        logger.info(f"Collection {COLLECTION_NAME} already exists")
-        return
+    if COLLECTION_NAME not in existing:
+        qdrant.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=384, distance=Distance.COSINE)
+        )
+        logger.info(f"Created collection {COLLECTION_NAME}")
+    else:
+        logger.info(f"Collection {COLLECTION_NAME} exists")
+
+def store_articles_in_qdrant(articles: list) -> int:
+    """Store articles — REPLACES old data so feed is always fresh."""
+    global last_article_count
+
+    logger.info(f"Storing {len(articles)} fresh articles in Qdrant...")
+
+    # Delete old collection and recreate so data is always fresh
+    try:
+        qdrant.delete_collection(COLLECTION_NAME)
+    except:
+        pass
 
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(
-            size=384,
-            distance=Distance.COSINE
-        )
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE)
     )
-    logger.info(f"Created collection {COLLECTION_NAME}")
-
-def store_articles_in_qdrant(articles: list):
-    logger.info(f"Storing {len(articles)} articles in Qdrant...")
 
     texts = [f"{a['title']} {a['summary']}" for a in articles]
-    embeddings = embedder.encode(texts, show_progress_bar=True, batch_size=32)
+    embeddings = embedder.encode(texts, show_progress_bar=False, batch_size=32)
 
     points = []
     for i, (article, embedding) in enumerate(zip(articles, embeddings)):
-        point_id = generate_article_id(article["link"] + str(i))
+        point_id = generate_article_id(article["link"], i)
         points.append(PointStruct(
             id=point_id,
             vector=embedding.tolist(),
@@ -213,14 +218,31 @@ def store_articles_in_qdrant(articles: list):
     batch_size = 50
     for i in range(0, len(points), batch_size):
         batch = points[i:i + batch_size]
-        qdrant.upsert(
-            collection_name=COLLECTION_NAME,
-            points=batch
-        )
-        logger.info(f"Stored batch {i//batch_size + 1}")
+        qdrant.upsert(collection_name=COLLECTION_NAME, points=batch)
 
-    logger.info("All articles stored in Qdrant successfully")
+    last_article_count = len(points)
+    logger.info(f"Stored {len(points)} fresh articles")
     return len(points)
+
+def do_full_refresh() -> dict:
+    """Run Actor, fetch articles, store in Qdrant. Returns summary."""
+    global last_refresh_time
+
+    dataset_id = trigger_fresh_apify_run()
+    articles = fetch_articles_from_dataset(dataset_id)
+
+    if not articles:
+        raise Exception("No articles returned from Actor")
+
+    stored = store_articles_in_qdrant(articles)
+    last_refresh_time = datetime.now().isoformat()
+
+    return {
+        "articles_fetched": len(articles),
+        "articles_stored": stored,
+        "apify_dataset_id": dataset_id,
+        "refreshed_at": last_refresh_time
+    }
 
 def search_similar_articles(query: str, limit: int = 15) -> list:
     query_vector = embedder.encode(query).tolist()
@@ -307,9 +329,6 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
 
         result = response.json()
         content = result['choices'][0]['message']['content']
-
-        import json
-        import re
         json_match = re.search(r'\{.*\}', content, re.DOTALL)
         if json_match:
             return json.loads(json_match.group())
@@ -333,32 +352,48 @@ Provide a comprehensive misinformation risk analysis. Respond ONLY with valid JS
             "summary": f"Analysis for '{topic}' is being processed. {len(articles)} articles found."
         }
 
+# ============ BACKGROUND AUTO-REFRESH ============
+
+async def auto_refresh_loop():
+    """Runs in background — refreshes data every 30 minutes."""
+    while True:
+        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+        try:
+            logger.info("Auto-refresh triggered...")
+            result = do_full_refresh()
+            logger.info(f"Auto-refresh complete: {result['articles_stored']} articles stored")
+        except Exception as e:
+            logger.error(f"Auto-refresh failed: {e}")
+
 # ============ API ENDPOINTS ============
 
 @app.on_event("startup")
 async def startup_event():
-    logger.info("Starting Sentinel API...")
+    global last_refresh_time
+    logger.info("Starting Sentinel API v3.0...")
     setup_qdrant_collection()
 
-    collection_info = qdrant.get_collection(COLLECTION_NAME)
-    if collection_info.points_count == 0:
-        logger.info("No articles in database. Fetching from Apify...")
-        articles = fetch_apify_articles()
-        if articles:
-            stored = store_articles_in_qdrant(articles)
-            logger.info(f"Startup complete. {stored} articles ready.")
-    else:
-        logger.info(f"Startup complete. {collection_info.points_count} articles already in database.")
+    # Always fetch fresh data on startup
+    try:
+        logger.info("Fetching fresh data from your Apify Actor on startup...")
+        result = do_full_refresh()
+        logger.info(f"Startup complete. {result['articles_stored']} fresh articles ready.")
+    except Exception as e:
+        logger.error(f"Startup refresh failed: {e}. API will still run.")
+
+    # Start background auto-refresh
+    asyncio.create_task(auto_refresh_loop())
 
 @app.get("/")
 async def root():
     collection_info = qdrant.get_collection(COLLECTION_NAME)
     return {
         "status": "Sentinel API is running",
-        "version": "2.0",
+        "version": "3.0",
         "articles_in_database": collection_info.points_count,
-        "apify_integration": "Apify SDK + RSS Feed Aggregator Actor",
-        "qdrant_integration": "Semantic vector search with cosine similarity",
+        "last_refresh": last_refresh_time,
+        "actor_used": YOUR_ACTOR_ID,
+        "auto_refresh_interval": f"Every {REFRESH_INTERVAL_SECONDS // 60} minutes",
         "endpoints": [
             "/api/live-feed",
             "/api/analyze/{topic}",
@@ -396,13 +431,14 @@ async def get_live_feed(limit: int = 30):
                 "scraped_at": p.get("scraped_at", "")
             })
 
-        articles.sort(key=lambda x: x["trust_score"])
+        # Sort by scraped_at descending so newest articles appear first
+        articles.sort(key=lambda x: x.get("scraped_at", ""), reverse=True)
 
         return {
             "total_articles": total,
             "returned": len(articles),
             "articles": articles,
-            "last_updated": datetime.now().isoformat()
+            "last_updated": last_refresh_time or datetime.now().isoformat()
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -498,21 +534,10 @@ async def get_network(topic: str):
 
 @app.get("/api/refresh")
 async def refresh_data():
+    """Manual refresh — triggers your own Apify Actor and stores fresh data."""
     try:
-        new_dataset_id = trigger_fresh_apify_run()
-        articles = fetch_apify_articles(new_dataset_id)
-        if not articles:
-            raise HTTPException(status_code=500, detail="Failed to fetch articles from Apify")
-        stored = store_articles_in_qdrant(articles)
-        return {
-            "status": "success",
-            "articles_fetched": len(articles),
-            "articles_stored": stored,
-            "apify_dataset_id": new_dataset_id,
-            "refreshed_at": datetime.now().isoformat()
-        }
-    except HTTPException:
-        raise
+        result = do_full_refresh()
+        return {"status": "success", **result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -523,7 +548,7 @@ async def get_stats():
 
         results = qdrant.scroll(
             collection_name=COLLECTION_NAME,
-            limit=200,
+            limit=500,
             with_payload=True,
             with_vectors=False
         )
@@ -546,6 +571,8 @@ async def get_stats():
             "total_articles": collection_info.points_count,
             "trust_distribution": trust_distribution,
             "articles_by_source": sources,
+            "last_refresh": last_refresh_time,
+            "actor_id": YOUR_ACTOR_ID,
             "collection_status": "healthy",
             "last_checked": datetime.now().isoformat()
         }
@@ -555,16 +582,6 @@ async def get_stats():
 # ============ RUN SERVER ============
 if __name__ == "__main__":
     print("\n" + "="*50)
-    print("SENTINEL API STARTING")
+    print("SENTINEL API v3.0 STARTING")
     print("="*50)
-    print("API will be available at: http://localhost:8000")
-    print("API docs at: http://localhost:8000/docs")
-    print("="*50 + "\n")
-
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False, log_level="info")
